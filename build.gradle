@@ -1,0 +1,174 @@
+plugins {
+	id 'dev.architectury.loom' version '1.7-SNAPSHOT'
+	id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = project.archives_base_name
+}
+
+loom {
+	accessWidenerPath = file("src/main/resources/vulkanmod.accesswidener")
+
+	forge {
+		convertAccessWideners = true
+		mixinConfig "vulkanmod.mixins.json", "vulkanmod.compat.mixins.json"
+	}
+
+	runs {
+		remove server
+	}
+}
+
+repositories {
+	maven { url = "https://maven.minecraftforge.net/" }
+	exclusiveContent {
+		forRepository { maven { url = "https://api.modrinth.com/maven" } }
+		filter { includeGroup "maven.modrinth" }
+	}
+}
+
+def devTestMods = [
+	"security-craft:UDbRAGQU", // [1.20.1] SecurityCraft v1.10.1
+]
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	mappings loom.officialMojangMappings()
+	forge "net.minecraftforge:forge:${project.forge_version}"
+
+	// Dev runs only, to test compatibility with mods that hook the same renderer code. Loom remaps them to
+	// dev names; they are staged into run/mods (see stageDevTestMods) instead of the classpath, so Forge loads
+	// them into the game layer like in production.
+	// Modrinth version ids, not version numbers: those are reused across Minecraft versions.
+	devTestMods.each { modCompileOnly "maven.modrinth:$it" }
+}
+
+project.ext.lwjglVersion = "3.3.1"
+project.ext.winNatives = "natives-windows"
+project.ext.linuxNatives = "natives-linux"
+project.ext.macosNatives = "natives-macos"
+project.ext.macosArmNatives = "natives-macos-arm64"
+
+configurations {
+	bundledNatives {
+		canBeConsumed = false
+		transitive = false
+	}
+	devGameLibraries {
+		canBeConsumed = false
+		transitive = false
+	}
+}
+
+def lwjglModules = ["lwjgl-vulkan", "lwjgl-vma", "lwjgl-shaderc"]
+
+dependencies {
+	// Minecraft ships LWJGL core, GLFW, STB, OpenAL, but not the Vulkan bindings or the helper libraries.
+	// In production Forge loads the jar-in-jar copies into the game module layer, while Minecraft's own
+	// LWJGL sits in the boot layer and cannot see them. Dev runs load them the same way (see below)
+	// instead of putting them on the classpath, which would hide that difference.
+	ext.lwjglModule = { String name ->
+		compileOnly("org.lwjgl:$name:$lwjglVersion")
+		include("org.lwjgl:$name:$lwjglVersion")
+		devGameLibraries("org.lwjgl:$name:$lwjglVersion")
+	}
+	// The natives jars of every platform share one Java module name, so they cannot be jar-in-jar'd on Forge.
+	// Their libraries are bundled as resources instead and extracted at runtime (see NativeLibraries).
+	ext.lwjglNatives = { String name, List<String> platforms ->
+		platforms.each { platform ->
+			bundledNatives("org.lwjgl:$name:$lwjglVersion:$platform")
+		}
+	}
+
+	def allPlatforms = [winNatives, linuxNatives, macosNatives, macosArmNatives]
+
+	lwjglModule("lwjgl-vulkan")
+	lwjglModule("lwjgl-vma")
+	lwjglModule("lwjgl-shaderc")
+	lwjglNatives("lwjgl-vma", allPlatforms)
+	lwjglNatives("lwjgl-shaderc", allPlatforms)
+	// MoltenVK
+	lwjglNatives("lwjgl-vulkan", [macosNatives, macosArmNatives])
+}
+
+def generatedNatives = layout.buildDirectory.dir("generated/natives")
+
+def extractNatives = tasks.register("extractNatives", Sync) {
+	from({ configurations.bundledNatives.collect { zipTree(it) } }) {
+		include "windows/**", "linux/**", "macos/**"
+	}
+	into(generatedNatives.map { it.dir("META-INF/vulkanmod-natives") })
+}
+
+sourceSets.main.resources.srcDir(files(generatedNatives).builtBy(extractNatives))
+
+// Dev runs: stage the LWJGL modules in the run's mods folder as Forge game libraries, which is how
+// Forge treats jar-in-jar libraries in production
+def stageDevGameLibraries = lwjglModules.collect { String name ->
+	tasks.register("stageDevGameLibrary-$name", Jar) {
+		def source = providers.provider { configurations.devGameLibraries.find { it.name == "$name-${lwjglVersion}.jar" } }
+		archiveFileName = "dev-gamelibrary-$name-${lwjglVersion}.jar"
+		destinationDirectory = file("run/mods")
+		from({ zipTree(source.get()) }) {
+			exclude "META-INF/MANIFEST.MF"
+		}
+		doFirst {
+			new java.util.jar.JarFile(source.get()).withCloseable { jar ->
+				jar.manifest.mainAttributes.each { key, value -> manifest.attributes((key.toString()): value) }
+			}
+			manifest.attributes("FMLModType": "GAMELIBRARY")
+		}
+	}
+}
+
+def stageDevTestMods = tasks.register("stageDevTestMods", Copy) {
+	from(fileTree(".gradle/loom-cache/remapped_mods") {
+		devTestMods.each { include "**/maven/modrinth/${it.replace(':', '/')}/*.jar" }
+		exclude "**/*-sources.jar"
+	})
+	into("run/mods")
+	eachFile { it.path = "dev-testmod-${it.name}" }
+	includeEmptyDirs = false
+}
+
+tasks.matching { it.name == "runClient" }.configureEach {
+	dependsOn(stageDevGameLibraries, stageDevTestMods)
+}
+
+processResources {
+	inputs.property "version", project.version
+
+	filesMatching("META-INF/mods.toml") {
+		expand "version": project.version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 17
+	it.options.encoding = "UTF-8"
+}
+
+java {
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_17
+	targetCompatibility = JavaVersion.VERSION_17
+}
+
+jar {
+	from("LICENSE") {
+		rename { "${it}_${project.base.archivesName.get()}" }
+	}
+}
+
+publishing {
+	publications {
+		mavenJava(MavenPublication) {
+			from components.java
+		}
+	}
+}
